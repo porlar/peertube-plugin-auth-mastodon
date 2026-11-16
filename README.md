@@ -13,10 +13,40 @@ Requires PeerTube >= 8.0 and a Mastodon server with the `profile` scope (Mastodo
 
 | Setting | Required for | Notes |
 |---|---|---|
-| Mastodon server URL | both | e.g. `https://mastodon.example`. Only accounts on this server can sign in. |
+| Default Mastodon server URL | both | e.g. `https://mastodon.example`. Token logins with a plain username use this server. |
 | Allowed Mastodon app IDs | app token login | Comma-separated. Only tokens issued to these Mastodon apps can sign in. Token sign-in is refused while this is empty. |
 | Client ID / secret | web button | Create an app on Mastodon with scope `profile` and redirect URI `https://<peertube>/plugins/auth-mastodon/router/callback`. Leave empty for app-only login. |
 | Login button label | web button | Default "Sign in with Mastodon". |
+| Additional Mastodon servers | both | Optional JSON array, see below. |
+
+Only accounts of configured servers can sign in.
+
+### Multiple Mastodon servers
+
+One PeerTube can accept accounts from several Mastodon servers. Keep the first server in the settings above and list the others in **Additional Mastodon servers**:
+
+```json
+[
+  {
+    "url": "https://other.example",
+    "allowedAppIds": "12, 34",
+    "clientId": "...",
+    "clientSecret": "...",
+    "buttonLabel": "Sign in with other.example",
+    "domain": "example.com"
+  }
+]
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `url` | yes | Server URL. |
+| `allowedAppIds` | for app token login | App IDs on *this* server (string or array). App IDs differ between servers. |
+| `clientId` / `clientSecret` | for its web button | Register an app on that server with the same redirect URI as above. Each server with credentials gets its own button. |
+| `buttonLabel` | no | Default "Sign in with &lt;host&gt;". |
+| `domain` | no | Only when handles use another domain than `url` (Mastodon `LOCAL_DOMAIN` ≠ `WEB_DOMAIN`). |
+
+The default server can also be left empty: the first additional server then becomes the default. Invalid or duplicate entries are skipped and logged as errors.
 
 ## App token login
 
@@ -27,14 +57,15 @@ Content-Type: application/x-www-form-urlencoded
 client_id=<from GET /api/v1/oauth-clients/local>
 client_secret=<from GET /api/v1/oauth-clients/local>
 grant_type=password
-username=<Mastodon username, e.g. alice_w>
+username=<Mastodon username, e.g. alice_w, or alice_w@other.example for an additional server>
 password=mastodon:<Mastodon access token>
 ```
 
 The response is a normal PeerTube token (`access_token`, `refresh_token`, `expires_in`). Refresh it with `grant_type=refresh_token` as usual. When the refresh token expires, repeat the exchange with the current Mastodon token.
 
 - The `mastodon:` prefix is required. Passwords without it are never sent to Mastodon, so local PeerTube logins (e.g. `root`) are unaffected.
-- `username` must match the owner of the Mastodon token (case-insensitive). This is the Mastodon username, which can differ from the PeerTube one (see below): read the PeerTube username from `GET /api/v1/users/me`.
+- `username` picks the Mastodon server: `alice_w` uses the default server, `alice_w@other.example` (or `@alice_w@other.example`) uses that configured server. A domain that is not configured is refused without contacting it, so tokens are only sent to configured servers.
+- The username part must match the owner of the Mastodon token (case-insensitive). This is the Mastodon username, which can differ from the PeerTube one (see below): read the PeerTube username from `GET /api/v1/users/me`.
 - PeerTube rejects login passwords over 50 characters, which `mastodon:<token>` exceeds. The plugin uses the `filter:oauth.password-grant.get-user.params` hook to drop the password once it has accepted the login, so this limit does not apply to Mastodon tokens.
 - The Mastodon token is checked against `GET /api/v1/accounts/verify_credentials` and `GET /api/v1/apps/verify_credentials`, and is not stored. The app's `id` must be in the allowed list. Names are not checked, because anyone can register an app with any name.
 - On logout, revoke the PeerTube token too (`POST /api/v1/users/revoke-token`): revoking the Mastodon token does not end the PeerTube session.
@@ -43,7 +74,7 @@ The response is a normal PeerTube token (`access_token`, `refresh_token`, `expir
 
 | PeerTube | From Mastodon |
 |---|---|
-| Username | `username`, lowercased. PeerTube adds a suffix (`alice-1`) if the name is taken, including by a deleted user. |
+| Username | `username`, lowercased. PeerTube adds a suffix (`alice-1`) if the name is taken, including by a deleted user or by the same name on another Mastodon server. |
 | Display name | `display_name` (falls back to the username) |
 | Email | `mastodon-<account id>@<mastodon host>`. Placeholder: Mastodon does not share emails with OAuth apps. |
 | External ID | `<mastodon host>:<account id>`. Accounts are matched on this, so a Mastodon rename keeps the same PeerTube account. |

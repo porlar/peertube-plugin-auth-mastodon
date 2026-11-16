@@ -88,6 +88,8 @@ curl -s "$PT/api/v1/users/token" \
 
 Then send the PeerTube URL to the app team, as each app build needs it in `PEERTUBE_URL`.
 
+To accept accounts from more than one Mastodon server, see "Multiple Mastodon servers" in `INSTALL.md`. The app must then send `username=<name>@<server domain>` for users of the additional servers.
+
 ## Upgrade
 
 Repeat step 2, then run the install request from step 4. Settings are kept. When upgrading from 0.1.0, set `allowed-app-ids` too, or token sign-in stops working.
@@ -96,7 +98,7 @@ Repeat step 2, then run the install request from step 4. Settings are kept. When
 
 | Symptom | Likely cause |
 |---|---|
-| Every sign-in returns `400 invalid_grant` | `mastodon-url` is wrong, `allowed-app-ids` is empty or missing the app, PeerTube can't reach Mastodon, or the username doesn't match the token's owner |
+| Every sign-in returns `400 invalid_grant` | `mastodon-url` is wrong, the username's `@domain` is not a configured server, `allowed-app-ids` is empty or missing the app, PeerTube can't reach Mastodon, or the username doesn't match the token's owner |
 | `429` responses | Login rate limit reached. Check `trust_proxy` first. |
 
 ## Known risk

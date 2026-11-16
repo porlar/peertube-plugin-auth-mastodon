@@ -10,7 +10,7 @@ You need:
 
 - PeerTube 8.0 or newer, with the admin (`root`) login
 - The plugin folder (`peertube-plugin-auth-mastodon`)
-- The Mastodon server URL for this community, for example `https://mastodon.example`. Each deployment serves one Mastodon server.
+- The Mastodon server URL for this community, for example `https://mastodon.example`. More servers can be added later, see [Multiple Mastodon servers](#multiple-mastodon-servers).
 - The client ID and secret of each Mastodon app whose tokens may sign in, usually the app the mobile build uses
 - HTTPS outbound access from PeerTube to that Mastodon server
 - `curl` and `jq` on the machine running the API commands
@@ -173,10 +173,33 @@ Each app build needs `PEERTUBE_URL` set to the PeerTube URL for that community. 
 |---|---|
 | Every token request returns `400 invalid_grant` | `mastodon-url` is unset or wrong, `allowed-app-ids` is empty or missing the app, PeerTube can't reach Mastodon, or `username` doesn't match the token's owner |
 | Requests return `429` | Login rate limit reached. Check `trust_proxy` first. |
-| Valid token refused for a user of another Mastodon server | Expected. Only accounts on the configured server can sign in. |
+| Valid token refused for a user of another Mastodon server | Expected unless that server is configured. For an additional server, the app must send `username=<name>@<server domain>`, and the app ID must be in that server's `allowedAppIds`. |
+| An additional server is ignored | Its JSON entry is invalid or duplicates another server. Check the PeerTube logs for `Ignoring invalid Mastodon server setting`. |
 | Install fails | Check that the path is correct inside the container and owned by `peertube`, then check the PeerTube logs. |
 
 The plugin logs rejected logins at `info` level. It doesn't log or store Mastodon tokens.
+
+## Multiple Mastodon servers
+
+To let accounts of several Mastodon servers sign in to the same PeerTube, add the other servers to the `mastodon-servers` setting as a JSON array. The single-server settings above stay the default server.
+
+For each additional server, find its allowed app IDs with the commands in [step 4](#4-configure-it), using that server's URL and app credentials. Then save all settings in one request (settings left out are cleared):
+
+```bash
+SERVERS='[{"url":"https://other.example","allowedAppIds":"<app id on other.example>"}]'
+
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
+  "$PT/api/v1/plugins/peertube-plugin-auth-mastodon/settings" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg servers "$SERVERS" '{settings:{
+        "mastodon-url":"https://<mastodon domain>",
+        "allowed-app-ids":"<app id>",
+        "mastodon-servers":$servers}}')"
+```
+
+Expected result: `204`. If the web button is enabled, include `client-id`, `client-secret` and `auth-display-name` in the same request.
+
+The app then signs in users of that server with `username=<name>@other.example`. Users of the default server can keep sending the plain username. Field reference: see the README.
 
 ## Optional: web login button
 
@@ -186,6 +209,8 @@ This adds "Sign in with Mastodon" to the PeerTube website. The mobile app doesn'
 2. In PeerTube, go to Administration > Plugins > auth-mastodon > Settings, and enter the client ID and secret. Store the secret in your secrets manager.
 
 These fields can also be set through the settings API. Send all settings in the same request.
+
+For an additional server, register the app on that server with the same redirect URI, and add `clientId` and `clientSecret` to its entry in `mastodon-servers`. Each server with credentials gets its own button.
 
 ## Known risks
 

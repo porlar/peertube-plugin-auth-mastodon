@@ -2,6 +2,7 @@ const { test, beforeEach, afterEach } = require('node:test')
 const assert = require('node:assert/strict')
 
 const { buildAuthResult, extractTokenFromPassword, normalizeBaseUrl, parseAllowedAppIds } = require('../lib/mastodon')
+const { buildServers, resolveServerForLogin } = require('../lib/servers')
 const plugin = require('../main')
 
 const ACCOUNT = { id: '109876', username: 'Alice_W', display_name: 'Alice W 🎬' }
@@ -227,7 +228,8 @@ test('web flow: authorize redirect, then callback authenticates the user', async
     query: { code: 'the-code', state: authorizeUrl.searchParams.get('state') },
     cookies: {
       'peertube-auth-mastodon-state': startRes.cookies['peertube-auth-mastodon-state'],
-      'peertube-auth-mastodon-verifier': startRes.cookies['peertube-auth-mastodon-verifier']
+      'peertube-auth-mastodon-verifier': startRes.cookies['peertube-auth-mastodon-verifier'],
+      'peertube-auth-mastodon-server': startRes.cookies['peertube-auth-mastodon-server']
     }
   }
   await registered.routes['/callback'](req, buildRes())
@@ -251,10 +253,134 @@ test('web flow: callback with a mismatched state is rejected', async () => {
   const res = buildRes()
   await registered.routes['/callback']({
     query: { code: 'c', state: 'forged' },
-    cookies: { 'peertube-auth-mastodon-state': 'real', 'peertube-auth-mastodon-verifier': 'v' }
+    cookies: { 'peertube-auth-mastodon-state': 'real', 'peertube-auth-mastodon-verifier': 'v', 'peertube-auth-mastodon-server': 'mastodon' }
   }, res)
 
   assert.equal(res.redirectedTo, '/login?externalAuthError=true')
   assert.equal(registered.authenticated, undefined)
   assert.equal(fetchCalls.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// Multiple Mastodon servers
+
+const MULTI_SETTINGS = {
+  ...TOKEN_LOGIN_SETTINGS,
+  'mastodon-servers': JSON.stringify([
+    { url: 'https://other.example', allowedAppIds: [ '99' ] },
+    { url: 'https://social.example', domain: 'example.com', allowedAppIds: '7', clientId: 'cid2', clientSecret: 'secret2' }
+  ])
+}
+
+test('buildServers keeps the single-server settings first and adds the extra servers', () => {
+  const servers = buildServers(MULTI_SETTINGS)
+  assert.deepEqual(servers.map(s => [ s.host, s.authName, s.allowedAppIds ]), [
+    [ 'mastodon.example', 'mastodon', [ '12', '34' ] ],
+    [ 'other.example', 'mastodon-other-example', [ '99' ] ],
+    [ 'social.example', 'mastodon-social-example', [ '7' ] ]
+  ])
+  assert.equal(servers[2].buttonLabel, 'Sign in with social.example')
+})
+
+test('buildServers skips invalid and duplicate entries', () => {
+  const errors = []
+  const logger = { error: msg => errors.push(msg) }
+
+  assert.equal(buildServers({ 'mastodon-servers': '{not json' }, logger).length, 0)
+  const servers = buildServers({
+    'mastodon-url': 'https://mastodon.example',
+    'mastodon-servers': JSON.stringify([ { url: 'mastodon.example/' }, { nope: 1 }, 'x', { url: 'https://ok.example' } ])
+  }, logger)
+
+  assert.deepEqual(servers.map(s => s.host), [ 'mastodon.example', 'ok.example' ])
+  assert.equal(errors.length, 4)
+})
+
+test('resolveServerForLogin picks the server from the username domain', () => {
+  const servers = buildServers(MULTI_SETTINGS)
+  const pick = id => {
+    const r = resolveServerForLogin(servers, id)
+    return r && [ r.server.host, r.username ]
+  }
+
+  assert.deepEqual(pick('alice_w'), [ 'mastodon.example', 'alice_w' ])
+  assert.deepEqual(pick('alice_w@other.example'), [ 'other.example', 'alice_w' ])
+  assert.deepEqual(pick('@alice_w@OTHER.example'), [ 'other.example', 'alice_w' ])
+  assert.deepEqual(pick('alice_w@example.com'), [ 'social.example', 'alice_w' ])
+  assert.equal(pick('alice_w@unknown.example'), null)
+  assert.equal(pick('alice_w@'), null)
+})
+
+test('token login uses the server named in the username and its own app allowlist', async () => {
+  const { api, registered } = buildFakePeerTube(MULTI_SETTINGS)
+  await plugin.register(api)
+  const login = registered.passAuths[0].login
+  fetchResponses[ACCOUNT_PATH] = { status: 200, body: ACCOUNT }
+
+  fetchResponses[APP_PATH] = { status: 200, body: { id: '99' } }
+  const result = await login({ id: 'alice_w@other.example', password: 'mastodon:tok' })
+  assert.equal(result.externalId, 'other.example:109876')
+  assert.equal(result.email, 'mastodon-109876@other.example')
+  assert.ok(fetchCalls.every(c => c.url.startsWith('https://other.example/')))
+
+  // App 12 is allowed on the default server only
+  fetchResponses[APP_PATH] = { status: 200, body: { id: '12' } }
+  assert.equal(await login({ id: 'alice_w@other.example', password: 'mastodon:tok' }), null)
+})
+
+test('token login never sends a token to a server that is not configured', async () => {
+  const { api, registered } = buildFakePeerTube(MULTI_SETTINGS)
+  await plugin.register(api)
+
+  assert.equal(await registered.passAuths[0].login({ id: 'alice_w@evil.example', password: 'mastodon:tok' }), null)
+  assert.equal(fetchCalls.length, 0)
+})
+
+test('token login works with only additional servers configured', async () => {
+  const { api, registered } = buildFakePeerTube({ 'mastodon-servers': MULTI_SETTINGS['mastodon-servers'] })
+  await plugin.register(api)
+  fetchResponses[ACCOUNT_PATH] = { status: 200, body: ACCOUNT }
+  fetchResponses[APP_PATH] = { status: 200, body: { id: '99' } }
+
+  const result = await registered.passAuths[0].login({ id: 'alice_w', password: 'mastodon:tok' })
+  assert.equal(result.externalId, 'other.example:109876')
+})
+
+test('web flow: one button per server with credentials, callback uses the chosen server', async () => {
+  const { api, registered, changeSettings } = buildFakePeerTube({
+    ...MULTI_SETTINGS,
+    'client-id': 'cid',
+    'client-secret': 'secret'
+  })
+  await plugin.register(api)
+  assert.deepEqual(registered.externalAuths.map(a => a.authName), [ 'mastodon', 'mastodon-social-example' ])
+
+  const startRes = buildRes()
+  registered.externalAuths[1].onAuthRequest({}, startRes)
+  const authorizeUrl = new URL(startRes.redirectedTo)
+  assert.equal(authorizeUrl.origin, 'https://social.example')
+  assert.equal(authorizeUrl.searchParams.get('client_id'), 'cid2')
+
+  fetchResponses['/oauth/token'] = { status: 200, body: { access_token: 'web-tok' } }
+  fetchResponses['/oauth/revoke'] = { status: 200, body: {} }
+  fetchResponses[ACCOUNT_PATH] = { status: 200, body: ACCOUNT }
+
+  await registered.routes['/callback']({
+    query: { code: 'the-code', state: authorizeUrl.searchParams.get('state') },
+    cookies: {
+      'peertube-auth-mastodon-state': startRes.cookies['peertube-auth-mastodon-state'],
+      'peertube-auth-mastodon-verifier': startRes.cookies['peertube-auth-mastodon-verifier'],
+      'peertube-auth-mastodon-server': startRes.cookies['peertube-auth-mastodon-server']
+    }
+  }, buildRes())
+
+  assert.equal(registered.authenticated.externalId, 'social.example:109876')
+  const tokenCall = fetchCalls.find(c => c.url.endsWith('/oauth/token'))
+  assert.equal(tokenCall.url, 'https://social.example/oauth/token')
+  assert.equal(tokenCall.options.body.get('client_secret'), 'secret2')
+
+  // Settings change re-registers every button without duplicates
+  await changeSettings()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(registered.externalAuths.length, 2)
 })

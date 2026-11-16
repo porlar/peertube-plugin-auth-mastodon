@@ -1,29 +1,34 @@
 const crypto = require('crypto')
 
 const {
-  normalizeBaseUrl,
   extractTokenFromPassword,
   verifyCredentials,
   verifyAppCredentials,
-  parseAllowedAppIds,
   isAllowedApp,
   exchangeCode,
   revokeToken,
   buildAuthResult
 } = require('./lib/mastodon')
+const { buildServers, resolveServerForLogin } = require('./lib/servers')
 
 const NPM_NAME = 'peertube-plugin-auth-mastodon'
 const TOKEN_AUTH_NAME = 'mastodon-token'
-const EXTERNAL_AUTH_NAME = 'mastodon'
 
 const COOKIE_PREFIX = 'peertube-auth-mastodon-'
 const COOKIE_MAX_AGE_MS = 1000 * 60 * 10
 
-const SETTING_NAMES = [ 'mastodon-url', 'auth-display-name', 'client-id', 'client-secret' ]
+const SETTING_NAMES = [
+  'mastodon-url',
+  'allowed-app-ids',
+  'auth-display-name',
+  'client-id',
+  'client-secret',
+  'mastodon-servers'
+]
 
 const store = {
-  userAuthenticated: null,
-  externalAuthRegistered: false
+  // authName -> { server, userAuthenticated }
+  webAuths: new Map()
 }
 
 async function register ({
@@ -40,14 +45,16 @@ async function register ({
 
   registerSetting({
     name: 'mastodon-url',
-    label: 'Mastodon server URL',
+    label: 'Default Mastodon server URL',
     type: 'input',
     private: true,
-    descriptionHTML: 'Example: <code>https://mastodon.example</code>. Only accounts of this server can sign in.'
+    descriptionHTML: 'Example: <code>https://mastodon.example</code>. ' +
+      'App token logins with a plain username (<code>alice</code>) use this server. ' +
+      'To accept accounts of more servers, add them in "Additional Mastodon servers" below.'
   })
   registerSetting({
     name: 'allowed-app-ids',
-    label: 'Allowed Mastodon app IDs (app token login)',
+    label: 'Allowed Mastodon app IDs on the default server (app token login)',
     type: 'input',
     private: true,
     descriptionHTML: 'IDs of the Mastodon apps whose tokens can sign in, separated by commas. ' +
@@ -55,14 +62,14 @@ async function register ({
   })
   registerSetting({
     name: 'auth-display-name',
-    label: 'Login button label',
+    label: 'Login button label for the default server',
     type: 'input',
     private: true,
     default: 'Sign in with Mastodon'
   })
   registerSetting({
     name: 'client-id',
-    label: 'Mastodon OAuth client ID (web button only)',
+    label: 'Mastodon OAuth client ID for the default server (web button only)',
     type: 'input',
     private: true,
     descriptionHTML: 'Leave the client ID and secret empty to disable the web login button and keep only app token login. ' +
@@ -70,12 +77,25 @@ async function register ({
   })
   registerSetting({
     name: 'client-secret',
-    label: 'Mastodon OAuth client secret (web button only)',
+    label: 'Mastodon OAuth client secret for the default server (web button only)',
     type: 'input-password',
     private: true
   })
+  registerSetting({
+    name: 'mastodon-servers',
+    label: 'Additional Mastodon servers',
+    type: 'input-textarea',
+    private: true,
+    descriptionHTML: 'JSON array, one object per server. Only <code>url</code> is required:<br>' +
+      '<code>[{"url": "https://other.example", "allowedAppIds": "12, 34", "clientId": "...", "clientSecret": "...", ' +
+      '"buttonLabel": "Sign in with other.example", "domain": "example.com"}]</code><br>' +
+      'Apps sign in to these servers with the username <code>alice@other.example</code>. ' +
+      '<code>domain</code> is only needed when account handles use another domain than <code>url</code>. ' +
+      'Each server with a client ID and secret gets its own login button, using the same redirect URI as above.'
+  })
 
-  // Apps: POST /api/v1/users/token with grant_type=password, username=<mastodon username>, password=mastodon:<mastodon access token>
+  // Apps: POST /api/v1/users/token with grant_type=password, username=<mastodon username>[@<server>],
+  // password=mastodon:<mastodon access token>
   registerIdAndPassAuth({
     authName: TOKEN_AUTH_NAME,
     getWeight: () => 60,
@@ -89,19 +109,18 @@ async function register ({
     handler: params => dropPasswordOfTokenLogin(params)
   })
 
-  getRouter().get('/callback', (req, res) => handleCallback(req, res, { settingsManager, peertubeHelpers }))
+  getRouter().get('/callback', (req, res) => handleCallback(req, res, { peertubeHelpers }))
 
-  await loadExternalAuth({ registerExternalAuth, unregisterExternalAuth, settingsManager, peertubeHelpers })
+  await loadExternalAuths({ registerExternalAuth, unregisterExternalAuth, settingsManager, peertubeHelpers })
 
   settingsManager.onSettingsChange(() => {
-    loadExternalAuth({ registerExternalAuth, unregisterExternalAuth, settingsManager, peertubeHelpers })
+    loadExternalAuths({ registerExternalAuth, unregisterExternalAuth, settingsManager, peertubeHelpers })
       .catch(err => logger.error('Cannot reload Mastodon external auth after settings change.', { err }))
   })
 }
 
 async function unregister () {
-  store.userAuthenticated = null
-  store.externalAuthRegistered = false
+  store.webAuths = new Map()
 }
 
 module.exports = {
@@ -116,45 +135,52 @@ async function loginWithMastodonToken ({ id, password }, { settingsManager, logg
   const accessToken = extractTokenFromPassword(password)
   if (!accessToken) return null
 
-  const baseUrl = normalizeBaseUrl(await settingsManager.getSetting('mastodon-url'))
-  if (!baseUrl) {
-    logger.warn('Mastodon token login attempted but the Mastodon server URL is not set.')
+  const servers = buildServers(await settingsManager.getSettings(SETTING_NAMES), logger)
+  if (servers.length === 0) {
+    logger.warn('Mastodon token login attempted but no Mastodon server is set.')
     return null
   }
 
-  const allowedAppIds = parseAllowedAppIds(await settingsManager.getSetting('allowed-app-ids'))
-  if (allowedAppIds.length === 0) {
-    logger.warn('Mastodon token login attempted but no allowed Mastodon app IDs are set.')
+  const target = resolveServerForLogin(servers, id)
+  if (!target) {
+    logger.info('Mastodon token login rejected for %s: not an account of a configured Mastodon server.', id)
+    return null
+  }
+
+  const { server, username } = target
+
+  if (server.allowedAppIds.length === 0) {
+    logger.warn('Mastodon token login attempted on %s but no allowed Mastodon app IDs are set for it.', server.host)
     return null
   }
 
   let account
   try {
-    account = await verifyCredentials(baseUrl, accessToken)
+    account = await verifyCredentials(server.baseUrl, accessToken)
   } catch (err) {
     logger.info('Mastodon token login rejected for %s: %s', id, err.message)
     return null
   }
 
-  if (typeof id !== 'string' || id.toLowerCase() !== account.username.toLowerCase()) {
-    logger.info('Mastodon token login rejected: username %s does not match token owner %s.', id, account.username)
+  if (typeof account?.username !== 'string' || username.toLowerCase() !== account.username.toLowerCase()) {
+    logger.info('Mastodon token login rejected: username %s does not match token owner %s.', id, account?.username)
     return null
   }
 
   let app
   try {
-    app = await verifyAppCredentials(baseUrl, accessToken)
+    app = await verifyAppCredentials(server.baseUrl, accessToken)
   } catch (err) {
     logger.info('Mastodon token login rejected for %s: %s', id, err.message)
     return null
   }
 
-  if (!isAllowedApp(app, allowedAppIds)) {
+  if (!isAllowedApp(app, server.allowedAppIds)) {
     logger.info('Mastodon token login rejected for %s: token was issued to app %s, which is not allowed.', id, app?.id)
     return null
   }
 
-  return buildAuthResult(account, baseUrl)
+  return buildAuthResult(account, server.baseUrl)
 }
 
 function dropPasswordOfTokenLogin (params) {
@@ -168,35 +194,35 @@ function dropPasswordOfTokenLogin (params) {
 
 // ---------------------------------------------------------------------------
 
-async function loadExternalAuth ({ registerExternalAuth, unregisterExternalAuth, settingsManager, peertubeHelpers }) {
+async function loadExternalAuths ({ registerExternalAuth, unregisterExternalAuth, settingsManager, peertubeHelpers }) {
   const { logger } = peertubeHelpers
 
-  if (store.externalAuthRegistered) {
-    unregisterExternalAuth(EXTERNAL_AUTH_NAME)
-    store.externalAuthRegistered = false
-    store.userAuthenticated = null
+  for (const authName of store.webAuths.keys()) {
+    unregisterExternalAuth(authName)
   }
+  store.webAuths = new Map()
 
-  const settings = await settingsManager.getSettings(SETTING_NAMES)
-  if (!settings['mastodon-url'] || !settings['client-id'] || !settings['client-secret']) {
-    logger.info('Mastodon web login button disabled: server URL, client ID or client secret is not set.')
+  const servers = buildServers(await settingsManager.getSettings(SETTING_NAMES), logger)
+  const webServers = servers.filter(s => s.webLoginEnabled)
+
+  if (webServers.length === 0) {
+    logger.info('Mastodon web login button disabled: no Mastodon server has a client ID and secret.')
     return
   }
 
-  const result = registerExternalAuth({
-    authName: EXTERNAL_AUTH_NAME,
-    authDisplayName: () => settings['auth-display-name'] || 'Sign in with Mastodon',
-    onAuthRequest: (req, res) => handleAuthRequest(req, res, { settings, peertubeHelpers })
-  })
+  for (const server of webServers) {
+    const result = registerExternalAuth({
+      authName: server.authName,
+      authDisplayName: () => server.buttonLabel,
+      onAuthRequest: (req, res) => handleAuthRequest(req, res, { server, peertubeHelpers })
+    })
 
-  store.userAuthenticated = result.userAuthenticated
-  store.externalAuthRegistered = true
+    store.webAuths.set(server.authName, { server, userAuthenticated: result.userAuthenticated })
+  }
 }
 
-function handleAuthRequest (req, res, { settings, peertubeHelpers }) {
+function handleAuthRequest (req, res, { server, peertubeHelpers }) {
   try {
-    const baseUrl = normalizeBaseUrl(settings['mastodon-url'])
-
     const state = randomString()
     const codeVerifier = randomString()
     const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url')
@@ -204,11 +230,12 @@ function handleAuthRequest (req, res, { settings, peertubeHelpers }) {
     const cookieOptions = { ...buildCookieOptions(peertubeHelpers), maxAge: COOKIE_MAX_AGE_MS }
     res.cookie(COOKIE_PREFIX + 'state', state, cookieOptions)
     res.cookie(COOKIE_PREFIX + 'verifier', codeVerifier, cookieOptions)
+    res.cookie(COOKIE_PREFIX + 'server', server.authName, cookieOptions)
 
-    const url = new URL(`${baseUrl}/oauth/authorize`)
+    const url = new URL(`${server.baseUrl}/oauth/authorize`)
     url.search = new URLSearchParams({
       response_type: 'code',
-      client_id: settings['client-id'],
+      client_id: server.clientId,
       redirect_uri: getRedirectUrl(peertubeHelpers),
       scope: 'profile',
       state,
@@ -223,18 +250,21 @@ function handleAuthRequest (req, res, { settings, peertubeHelpers }) {
   }
 }
 
-async function handleCallback (req, res, { settingsManager, peertubeHelpers }) {
+async function handleCallback (req, res, { peertubeHelpers }) {
   const { logger } = peertubeHelpers
 
   const expectedState = req.cookies?.[COOKIE_PREFIX + 'state']
   const codeVerifier = req.cookies?.[COOKIE_PREFIX + 'verifier']
+  const authName = req.cookies?.[COOKIE_PREFIX + 'server']
 
   const cookieOptions = buildCookieOptions(peertubeHelpers)
   res.clearCookie(COOKIE_PREFIX + 'state', cookieOptions)
   res.clearCookie(COOKIE_PREFIX + 'verifier', cookieOptions)
+  res.clearCookie(COOKIE_PREFIX + 'server', cookieOptions)
 
-  if (!store.userAuthenticated) {
-    logger.error('Received Mastodon callback but the web login is not enabled.')
+  const webAuth = typeof authName === 'string' ? store.webAuths.get(authName) : undefined
+  if (!webAuth) {
+    logger.error('Received Mastodon callback but the web login is not enabled for this server.')
     return redirectOnError(res)
   }
 
@@ -244,25 +274,25 @@ async function handleCallback (req, res, { settingsManager, peertubeHelpers }) {
     return redirectOnError(res)
   }
 
-  try {
-    const settings = await settingsManager.getSettings(SETTING_NAMES)
-    const baseUrl = normalizeBaseUrl(settings['mastodon-url'])
-    const clientOptions = { clientId: settings['client-id'], clientSecret: settings['client-secret'] }
+  const { server, userAuthenticated } = webAuth
 
-    const accessToken = await exchangeCode(baseUrl, {
+  try {
+    const clientOptions = { clientId: server.clientId, clientSecret: server.clientSecret }
+
+    const accessToken = await exchangeCode(server.baseUrl, {
       ...clientOptions,
       code,
       codeVerifier,
       redirectUri: getRedirectUrl(peertubeHelpers)
     })
 
-    const account = await verifyCredentials(baseUrl, accessToken)
+    const account = await verifyCredentials(server.baseUrl, accessToken)
 
     // We only needed the token to identify the user
-    revokeToken(baseUrl, { ...clientOptions, token: accessToken })
+    revokeToken(server.baseUrl, { ...clientOptions, token: accessToken })
       .catch(err => logger.debug('Cannot revoke Mastodon token after web login.', { err }))
 
-    return store.userAuthenticated({ req, res, ...buildAuthResult(account, baseUrl) })
+    return userAuthenticated({ req, res, ...buildAuthResult(account, server.baseUrl) })
   } catch (err) {
     logger.error('Mastodon web login failed.', { err })
     return redirectOnError(res)

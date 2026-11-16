@@ -1,9 +1,9 @@
 {
   "name": "peertube-plugin-auth-mastodon",
   "description": "Sign in to PeerTube with a Mastodon account: silent token exchange for apps, and a 'Sign in with Mastodon' button for the web.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "AGPL-3.0",
-  "author": "Newsmast Foundation",
+  "author": "porlar",
   "engine": {
     "peertube": ">=8.0.0"
   },
@@ -13,8 +13,8 @@
     "auth",
     "mastodon"
   ],
-  "homepage": "https://github.com/newsmast/peertube-plugin-auth-mastodon",
-  "bugs": "https://github.com/newsmast/peertube-plugin-auth-mastodon/issues",
+  "homepage": "https://github.com/porlar/peertube-plugin-auth-mastodon",
+  "bugs": "https://github.com/porlar/peertube-plugin-auth-mastodon/issues",
   "library": "./main.js",
   "staticDirs": {},
   "css": [],
