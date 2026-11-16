@@ -1,6 +1,6 @@
 # Installing peertube-plugin-auth-mastodon
 
-This plugin lets the mobile app sign users in to PeerTube with their Mastodon account. It does not require any change to PeerTube core or Mastodon, and it has no npm dependencies. It is not on npm, so it is installed from a folder on the server.
+This plugin lets the mobile app sign users in to PeerTube with their Mastodon account. It does not require any change to PeerTube core or Mastodon, and it has no npm dependencies. This guide installs it from a folder on the server. Without server access, install it from npm through the API instead: see [API-INSTALL.md](API-INSTALL.md).
 
 Tested on PeerTube 8.3.2 with the official Docker image (`chocobozzz/peertube:v8.3.2-trixie`, Node 22). Other setups are marked as untested below.
 

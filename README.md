@@ -82,6 +82,11 @@ The response is a normal PeerTube token (`access_token`, `refresh_token`, `expir
 
 Display name changes on Mastodon are not synced after the account is created.
 
+## Installing
+
+- No server access: [API-INSTALL.md](API-INSTALL.md) (installs from npm through the PeerTube API)
+- With server access: [INSTALL.md](INSTALL.md) (installs from a folder)
+
 ## Development
 
 ```
